@@ -1,4 +1,4 @@
-$version = "3.0"
+$version = "3.2"
 $results = @()
 $flagged = 0
 
@@ -29,19 +29,68 @@ function Write-Section([string]$title) {
     Write-Host ""
 }
 
-function Check-Modrinth([string]$jarName) {
+function Get-FileSHA512([string]$filePath) {
+    try {
+        $sha = [System.Security.Cryptography.SHA512]::Create()
+        $stream = [System.IO.File]::OpenRead($filePath)
+        $hashBytes = $sha.ComputeHash($stream)
+        $stream.Close()
+        $sha.Dispose()
+        return ([BitConverter]::ToString($hashBytes) -replace '-','').ToLower()
+    } catch {
+        return $null
+    }
+}
+
+function Get-FileSHA1([string]$filePath) {
+    try {
+        $sha = [System.Security.Cryptography.SHA1]::Create()
+        $stream = [System.IO.File]::OpenRead($filePath)
+        $hashBytes = $sha.ComputeHash($stream)
+        $stream.Close()
+        $sha.Dispose()
+        return ([BitConverter]::ToString($hashBytes) -replace '-','').ToLower()
+    } catch {
+        return $null
+    }
+}
+
+function Check-ModrinthByHash([string]$filePath) {
+    $sha512 = Get-FileSHA512 $filePath
+    $sha1   = Get-FileSHA1   $filePath
+    if (-not $sha512 -and -not $sha1) { return @{ Found = $null; Reason = "Hash failed" } }
+
+    try {
+        $body = @{ hashes = @($sha512, $sha1) | Where-Object { $_ }; algorithm = "sha512" } | ConvertTo-Json
+        $resp = Invoke-RestMethod -Uri "https://api.modrinth.com/v2/version_files" `
+            -Method Post -Body $body -ContentType "application/json" -TimeoutSec 8 -ErrorAction Stop
+
+        if ($resp -and $resp.PSObject.Properties.Count -gt 0) {
+            $hit = $resp.PSObject.Properties | Select-Object -First 1
+            $projectId = $hit.Value.project_id
+            $versionName = $hit.Value.name
+            return @{ Found = $true; ProjectId = $projectId; Version = $versionName }
+        }
+        return @{ Found = $false }
+    } catch {
+        return @{ Found = $null; Reason = $_.Exception.Message }
+    }
+}
+
+function Check-ModrinthByName([string]$jarName) {
     try {
         $slug = [System.IO.Path]::GetFileNameWithoutExtension($jarName)
         $slug = $slug -replace '[-_\s]?\d[\d\.\-\+\_]*$', ''
-        $slug = $slug -replace '[-_](fabric|forge|quilt|neoforge|mc|minecraft).*$', ''
+        $slug = $slug -replace '[-_](fabric|forge|quilt|neoforge|mc|minecraft|+fabric|+forge).*$', ''
+        $slug = $slug -replace '[_\-]$', ''
         $slug = $slug.ToLower().Trim()
-        $url = "https://api.modrinth.com/v2/search?query=$([uri]::EscapeDataString($slug))&limit=5&facets=[[%22project_type:mod%22]]"
+        $url  = "https://api.modrinth.com/v2/search?query=$([uri]::EscapeDataString($slug))&limit=5&facets=[[%22project_type:mod%22]]"
         $resp = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 6 -ErrorAction Stop
         foreach ($hit in $resp.hits) {
             $hitSlug  = $hit.slug.ToLower()
-            $hitTitle = $hit.title.ToLower()
-            if ($slug -like "*$hitSlug*" -or $hitSlug -like "*$slug*" -or $slug -like "*$hitTitle*") {
-                return @{ Found = $true; Title = $hit.title }
+            $hitTitle = $hit.title.ToLower() -replace '\s','-'
+            if ($slug -eq $hitSlug -or $hitSlug -like "*$slug*" -or $slug -like "*$hitSlug*") {
+                return @{ Found = $true; Title = $hit.title; Slug = $hit.slug }
             }
         }
         return @{ Found = $false }
@@ -63,25 +112,30 @@ $cheatKeywords = @(
     "xenos","syringe","injector","dllinjector",
     "cheatengine","cheat engine",
     "scyllahide","x64dbg","x32dbg","ollydbg",
-    "extremedumper","javaagent","bytecode",
+    "extremedumper","bytecode",
     "autoclicker","autoclick","opautoclicker",
     "ghostware","ghost","payload","bypass","remap",
     "hook","hack","cheats","hacked","exploit",
     "aimbot","killaura","kill aura","blink","scaffold",
-    "esp","wallhack","fullbright","nofall","speed",
-    "fly","flight","bhop","bunny","criticals","fastplace",
+    "esp","wallhack","fullbright","nofall",
+    "bhop","bunny","criticals","fastplace",
     "reach","timer","nuker","xray","cavefinder",
     "antiknockback","antikb","velocity","noslowdown"
 )
 
+$legitimateCmdLineContexts = @(
+    "theseus.jar","modrinthapp","modrinth",
+    "multimc","prismlauncher","prism",
+    "tlauncher","curseforge","gdlauncher",
+    "atlauncher","feather","badlion",
+    "minecraft.launcher","mojang"
+)
+
 $cheatProcessNames = @(
     "Vape","VapeV4","VapeLite","VapeNano",
-    "Drip","DripLite",
-    "Liquid","LiquidBounce",
-    "Meteor","MeteorClient",
-    "Wurst","WurstClient",
-    "Impact","ImpactClient",
-    "Future","FutureClient",
+    "Drip","DripLite","Liquid","LiquidBounce",
+    "Meteor","MeteorClient","Wurst","WurstClient",
+    "Impact","ImpactClient","Future","FutureClient",
     "Reflex","Sigma","Ares","Rise","Entropy",
     "Inertia","Rusherhack","Novoline",
     "Xenos","ExtremeDumper",
@@ -120,7 +174,6 @@ Write-Host ""
 
 if ($adminInput -eq "y" -and -not $isAdmin) {
     Write-Host "  [WARN] You said yes but this session is NOT elevated." -ForegroundColor Yellow
-    Write-Host "         Some checks may be limited." -ForegroundColor DarkGray
     Add-Result "Admin Check" "WARN" "User claimed admin but session is not elevated" "MEDIUM"
 } elseif ($isAdmin) {
     Write-Host "  [OK] Running as Administrator. Full scan enabled." -ForegroundColor Green
@@ -130,46 +183,64 @@ if ($adminInput -eq "y" -and -not $isAdmin) {
 
 Write-Host ""
 Write-Host "  Starting scan..." -ForegroundColor DarkGray
-Start-Sleep -Milliseconds 500
+Start-Sleep -Milliseconds 400
 
-Write-Section "Modrinth Mod Check"
+Write-Section "Modrinth Mod Verification"
 
 $modsPath = Join-Path $mcPath "mods"
 if (Test-Path $modsPath) {
     $jarFiles = Get-ChildItem -Path $modsPath -Filter "*.jar" -Recurse -ErrorAction SilentlyContinue
     Write-Host "  Found $($jarFiles.Count) mod(s) in: $modsPath" -ForegroundColor DarkGray
+    Write-Host "  Checking each mod via hash lookup + name search..." -ForegroundColor DarkGray
     Write-Host ""
+
     foreach ($jar in $jarFiles) {
         $nameLower = $jar.Name.ToLower()
-        $isSuspect = $false
+        Write-Host "  Checking: $($jar.Name)" -ForegroundColor White
+
+        $isSuspectName = $false
         $matchedKw = ""
         foreach ($kw in $cheatKeywords) {
-            if ($nameLower -like "*$kw*") { $isSuspect = $true; $matchedKw = $kw; break }
+            if ($nameLower -like "*$kw*") { $isSuspectName = $true; $matchedKw = $kw; break }
         }
-        if ($isSuspect) {
-            Write-Host "  [HIGH]   $($jar.Name)" -ForegroundColor Red
-            Write-Host "           Matched keyword: $matchedKw" -ForegroundColor DarkRed
+
+        if ($isSuspectName) {
+            Write-Host "  [HIGH]   Suspicious filename -- keyword: $matchedKw" -ForegroundColor Red
             Write-Host "           Path: $($jar.FullName)" -ForegroundColor DarkGray
+            Write-Host ""
             Add-Result "Mod Check" "SUSPECT NAME" "$($jar.FullName) [keyword: $matchedKw]" "HIGH"
             continue
         }
-        $check = Check-Modrinth $jar.Name
-        if ($check.Found -eq $true) {
-            Write-Host "  [OK]     $($jar.Name)" -ForegroundColor Green
-            Write-Host "           Modrinth: $($check.Title)" -ForegroundColor DarkGray
-            Add-Result "Mod Check" "CLEAN" "$($jar.Name) -- Modrinth: $($check.Title)" "INFO"
-        } elseif ($check.Found -eq $false) {
-            Write-Host "  [WARN]   $($jar.Name)" -ForegroundColor Yellow
-            Write-Host "           NOT found on Modrinth" -ForegroundColor DarkYellow
+
+        $hashCheck = Check-ModrinthByHash $jar.FullName
+        if ($hashCheck.Found -eq $true) {
+            Write-Host "  [OK]     Verified on Modrinth via file hash" -ForegroundColor Green
+            Write-Host "           Project ID: $($hashCheck.ProjectId)  |  Version: $($hashCheck.Version)" -ForegroundColor DarkGray
+            Write-Host ""
+            Add-Result "Mod Check" "HASH VERIFIED" "$($jar.Name) -- Project: $($hashCheck.ProjectId) v$($hashCheck.Version)" "INFO"
+            continue
+        }
+
+        $nameCheck = Check-ModrinthByName $jar.Name
+        if ($nameCheck.Found -eq $true) {
+            Write-Host "  [OK]     Found on Modrinth by name" -ForegroundColor Green
+            Write-Host "           Title: $($nameCheck.Title)  |  Slug: $($nameCheck.Slug)" -ForegroundColor DarkGray
+            Write-Host ""
+            Add-Result "Mod Check" "NAME VERIFIED" "$($jar.Name) -- $($nameCheck.Title) (modrinth.com/mod/$($nameCheck.Slug))" "INFO"
+        } elseif ($nameCheck.Found -eq $false) {
+            Write-Host "  [WARN]   NOT found on Modrinth (hash or name)" -ForegroundColor Yellow
+            Write-Host "           This mod is unknown -- could be a private/cheat mod" -ForegroundColor DarkYellow
             Write-Host "           Path: $($jar.FullName)" -ForegroundColor DarkGray
+            Write-Host ""
             Add-Result "Mod Check" "NOT ON MODRINTH" $jar.FullName "MEDIUM"
         } else {
-            Write-Host "  [INFO]   $($jar.Name) -- Modrinth API unreachable" -ForegroundColor DarkGray
+            Write-Host "  [INFO]   Could not reach Modrinth API" -ForegroundColor DarkGray
+            Write-Host ""
             Add-Result "Mod Check" "API UNREACHABLE" $jar.FullName "INFO"
         }
     }
 } else {
-    Write-Host "  No mods folder found." -ForegroundColor DarkGray
+    Write-Host "  No mods folder found at: $modsPath" -ForegroundColor DarkGray
 }
 
 Write-Section "Running Processes (Full List + Cheat Check)"
@@ -188,7 +259,6 @@ foreach ($proc in $runningProcs) {
     foreach ($cp in $cheatProcessNames) {
         if ($procLower -like "*$($cp.ToLower())*") { $isSuspect = $true; $matchedKw = $cp; break }
     }
-
     try { $path = $proc.MainModule.FileName } catch { $path = "N/A" }
 
     if ($isSuspect) {
@@ -223,29 +293,47 @@ if ($javaw) {
                 }
                 if ($isSuspect) {
                     Write-Host "  [HIGH]  $($mod.FileName)" -ForegroundColor Red
-                    Write-Host "          Matched keyword: $matchedKw" -ForegroundColor DarkRed
+                    Write-Host "          Matched: $matchedKw" -ForegroundColor DarkRed
                     Add-Result "DLL Inject" "SUSPECT" "$($mod.FileName) [keyword: $matchedKw]" "HIGH"
                 } else {
                     Write-Host "  [OK]    $($mod.FileName)" -ForegroundColor DarkGray
-                    Add-Result "DLL Inject" "CLEAN MODULE" $mod.FileName "INFO"
+                    Add-Result "DLL Inject" "CLEAN" $mod.FileName "INFO"
                 }
             }
         } catch {
-            Write-Host "  [WARN] Cannot read modules -- run as Administrator for full injection scan" -ForegroundColor Yellow
+            Write-Host "  [WARN] Cannot read modules -- run as Administrator for full scan" -ForegroundColor Yellow
             Add-Result "DLL Inject" "SKIPPED" "Insufficient permissions for PID $($proc.Id)" "MEDIUM"
         }
 
         Write-Host ""
-        Write-Host "  Scanning javaw command line strings..." -ForegroundColor DarkGray
+        Write-Host "  Scanning javaw command line..." -ForegroundColor DarkGray
         try {
             $wmi = Get-WmiObject Win32_Process -Filter "ProcessId=$($proc.Id)" -ErrorAction Stop
             $cmdLine = $wmi.CommandLine
-            Write-Host "  Command line: $cmdLine" -ForegroundColor DarkGray
+            $cmdLower = $cmdLine.ToLower()
+            Write-Host "  Command line captured. Scanning keywords..." -ForegroundColor DarkGray
             Add-Result "javaw Strings" "CMDLINE" $cmdLine "INFO"
+
             foreach ($kw in $cheatKeywords) {
-                if ($cmdLine -and $cmdLine.ToLower() -like "*$kw*") {
-                    Write-Host "  [HIGH] Suspicious string in command line: '$kw'" -ForegroundColor Red
-                    Add-Result "javaw Strings" "SUSPECT CMDLINE" "Keyword '$kw' found in: $cmdLine" "HIGH"
+                if ($cmdLine -and $cmdLower -like "*$kw*") {
+                    $kwIndex = $cmdLower.IndexOf($kw)
+                    $start   = [Math]::Max(0, $kwIndex - 80)
+                    $len     = [Math]::Min(160, $cmdLine.Length - $start)
+                    $context = $cmdLower.Substring($start, $len)
+
+                    $isWhitelisted = $false
+                    foreach ($legit in $legitimateCmdLineContexts) {
+                        if ($context -like "*$legit*") { $isWhitelisted = $true; break }
+                    }
+
+                    if (-not $isWhitelisted) {
+                        Write-Host "  [HIGH] Keyword '$kw' in command line" -ForegroundColor Red
+                        Write-Host "         Context: ...$(($cmdLine.Substring($start,$len)).Trim())..." -ForegroundColor DarkRed
+                        Add-Result "javaw Strings" "SUSPECT CMDLINE" "Keyword '$kw' | context: $($cmdLine.Substring($start,$len).Trim())" "HIGH"
+                    } else {
+                        Write-Host "  [OK]   '$kw' linked to known launcher -- whitelisted" -ForegroundColor DarkGray
+                        Add-Result "javaw Strings" "WHITELISTED" "Keyword '$kw' near known launcher" "INFO"
+                    }
                 }
             }
         } catch {
@@ -269,9 +357,9 @@ $phCLI = @(
     "C:\Program Files\System Informer\phcmd.exe"
 )
 
-$phRunning = Get-Process -Name "ProcessHacker","SystemInformer" -ErrorAction SilentlyContinue
+$phRunning   = Get-Process -Name "ProcessHacker","SystemInformer" -ErrorAction SilentlyContinue
 $phInstalled = $phPaths | Where-Object { Test-Path $_ }
-$phCLIPath = $phCLI | Where-Object { Test-Path $_ } | Select-Object -First 1
+$phCLIPath   = $phCLI   | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 if ($phRunning) {
     Write-Host "  [HIGH] ProcessHacker is currently RUNNING" -ForegroundColor Red
@@ -280,13 +368,12 @@ if ($phRunning) {
         Add-Result "ProcessHacker" "RUNNING" "$($p.ProcessName) PID $($p.Id)" "HIGH"
     }
 } elseif ($phInstalled) {
-    Write-Host "  [MEDIUM] ProcessHacker is installed but not running:" -ForegroundColor Yellow
+    Write-Host "  [MEDIUM] ProcessHacker installed but not running:" -ForegroundColor Yellow
     foreach ($ph in $phInstalled) { Write-Host "           $ph" -ForegroundColor DarkYellow }
     Add-Result "ProcessHacker" "INSTALLED" ($phInstalled -join ", ") "MEDIUM"
 } else {
-    Write-Host "  ProcessHacker not found on this system." -ForegroundColor DarkGray
-    Write-Host "  To enable ProcessHacker checks, download it from:" -ForegroundColor DarkGray
-    Write-Host "  https://processhacker.sourceforge.net" -ForegroundColor DarkGray
+    Write-Host "  ProcessHacker not found. Skipping." -ForegroundColor DarkGray
+    Write-Host "  Download from: https://processhacker.sourceforge.net" -ForegroundColor DarkGray
 }
 
 if ($phCLIPath -and $javaw) {
@@ -334,7 +421,7 @@ if (Test-Path $echoPath) {
                 foreach ($kw in $cheatKeywords) {
                     if ($content -and $content.ToLower() -like "*$kw*") {
                         Write-Host "  [HIGH] Keyword '$kw' found inside: $($f.Name)" -ForegroundColor Red
-                        Add-Result "Echo Journal" "SUSPECT CONTENT" "$($f.FullName) contains keyword: $kw" "HIGH"
+                        Add-Result "Echo Journal" "SUSPECT CONTENT" "$($f.FullName) contains: $kw" "HIGH"
                     }
                 }
             } catch {}
@@ -396,19 +483,12 @@ foreach ($dir in @("$env:TEMP","$env:LOCALAPPDATA\Temp","$env:APPDATA")) {
 Write-Section "Registry Traces"
 
 $regPaths = @(
-    "HKCU:\Software\Vape",
-    "HKCU:\Software\LiquidBounce",
-    "HKCU:\Software\MeteorClient",
-    "HKCU:\Software\WurstClient",
-    "HKCU:\Software\FutureClient",
-    "HKCU:\Software\Sigma",
-    "HKCU:\Software\Cheat Engine",
-    "HKLM:\SOFTWARE\Cheat Engine",
-    "HKCU:\Software\Rusherhack",
-    "HKCU:\Software\Novoline",
-    "HKCU:\Software\Inertia",
-    "HKCU:\Software\Rise",
-    "HKCU:\Software\Ares"
+    "HKCU:\Software\Vape","HKCU:\Software\LiquidBounce",
+    "HKCU:\Software\MeteorClient","HKCU:\Software\WurstClient",
+    "HKCU:\Software\FutureClient","HKCU:\Software\Sigma",
+    "HKCU:\Software\Cheat Engine","HKLM:\SOFTWARE\Cheat Engine",
+    "HKCU:\Software\Rusherhack","HKCU:\Software\Novoline",
+    "HKCU:\Software\Inertia","HKCU:\Software\Rise","HKCU:\Software\Ares"
 )
 
 $regFound = $false
@@ -425,11 +505,8 @@ foreach ($rp in $regPaths) {
         $regFound = $true
     }
 }
-if (-not $regFound) {
-    Write-Host "  No suspicious registry keys found." -ForegroundColor DarkGray
-}
+if (-not $regFound) { Write-Host "  No suspicious registry keys found." -ForegroundColor DarkGray }
 
-Write-Host ""
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════════╗" -ForegroundColor Cyan
 Write-Host "  ║            SCAN RESULTS              ║" -ForegroundColor Cyan
@@ -459,16 +536,12 @@ if ($mediums.Count -gt 0) {
 }
 if ($lows.Count -gt 0) {
     Write-Host "  [LOW]  $($lows.Count) finding(s):" -ForegroundColor DarkYellow
-    foreach ($r in $lows) {
-        Write-Host "    [$($r.Category)]  $($r.Detail)" -ForegroundColor DarkYellow
-    }
+    foreach ($r in $lows) { Write-Host "    [$($r.Category)]  $($r.Detail)" -ForegroundColor DarkYellow }
     Write-Host ""
 }
 if ($infos.Count -gt 0) {
     Write-Host "  [INFO]  $($infos.Count) finding(s):" -ForegroundColor Gray
-    foreach ($r in $infos) {
-        Write-Host "    [$($r.Category)]  $($r.Detail)" -ForegroundColor Gray
-    }
+    foreach ($r in $infos) { Write-Host "    [$($r.Category)]  $($r.Detail)" -ForegroundColor Gray }
     Write-Host ""
 }
 
@@ -488,9 +561,7 @@ $saveFolder = Read-Host "  Results folder"
 
 if (-not [string]::IsNullOrWhiteSpace($saveFolder)) {
     $saveFolder = $saveFolder.Trim().Trim('"')
-    if (-not (Test-Path $saveFolder)) {
-        New-Item -ItemType Directory -Path $saveFolder -Force | Out-Null
-    }
+    if (-not (Test-Path $saveFolder)) { New-Item -ItemType Directory -Path $saveFolder -Force | Out-Null }
     $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
     $logFile = Join-Path $saveFolder "SSI-Results_$timestamp.txt"
 
@@ -510,7 +581,7 @@ if (-not [string]::IsNullOrWhiteSpace($saveFolder)) {
     $lines += "══════════════════════════════════════"
     foreach ($r in $mediums) { $lines += "[$($r.Category)]  $($r.Status)"; $lines += "  $($r.Detail)"; $lines += "" }
     $lines += "══════════════════════════════════════"
-    $lines += "LOW SEVERITY ($($lows.Count))"
+    $lines += "LOW ($($lows.Count))"
     $lines += "══════════════════════════════════════"
     foreach ($r in $lows)    { $lines += "[$($r.Category)]  $($r.Detail)" }
     $lines += ""
